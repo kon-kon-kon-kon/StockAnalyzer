@@ -20,15 +20,24 @@ def now_jst():
 
 def load_data(today):
     if not DATA_PATH.exists():
-        return {"date": today, "snapshots": []}
+        return {
+            "date": today,
+            "snapshots": []
+        }
 
     try:
         data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
     except Exception:
-        return {"date": today, "snapshots": []}
+        return {
+            "date": today,
+            "snapshots": []
+        }
 
     if data.get("date") != today:
-        return {"date": today, "snapshots": []}
+        return {
+            "date": today,
+            "snapshots": []
+        }
 
     return data
 
