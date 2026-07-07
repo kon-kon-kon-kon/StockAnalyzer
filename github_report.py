@@ -20,24 +20,15 @@ def now_jst():
 
 def load_data(today):
     if not DATA_PATH.exists():
-        return {
-            "date": today,
-            "snapshots": []
-        }
+        return {"date": today, "snapshots": []}
 
     try:
         data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
     except Exception:
-        return {
-            "date": today,
-            "snapshots": []
-        }
+        return {"date": today, "snapshots": []}
 
     if data.get("date") != today:
-        return {
-            "date": today,
-            "snapshots": []
-        }
+        return {"date": today, "snapshots": []}
 
     return data
 
@@ -79,7 +70,6 @@ def render_table(targets, merged=False):
 
     for index, stock in enumerate(targets):
         row_class = "row-yellow" if index % 2 == 0 else "row-pink"
-
         first_detected = stock.get("first_detected", "-") if merged else "-"
         detected_count = stock.get("detected_count", "-") if merged else "-"
 
@@ -101,6 +91,7 @@ def render_table(targets, merged=False):
 """
 
     return f"""
+<div class="table-wrap pc-only">
 <table>
 <thead>
 <tr>
@@ -122,7 +113,75 @@ def render_table(targets, merged=False):
 {rows}
 </tbody>
 </table>
+</div>
 """
+
+
+def render_cards(targets, merged=False):
+    cards = ""
+
+    for index, stock in enumerate(targets):
+        card_class = "card-yellow" if index % 2 == 0 else "card-pink"
+        first_detected = stock.get("first_detected", "-") if merged else "-"
+        detected_count = stock.get("detected_count", "-") if merged else "-"
+
+        cards += f"""
+<div class="stock-card {card_class}">
+    <div class="card-header">
+        <div>
+            <div class="code">{escape(stock["code"])}</div>
+            <div class="company-name">{escape(stock["company"])}</div>
+        </div>
+        <div class="drop">{stock["diff_percent_num"]:.2f}%</div>
+    </div>
+
+    <div class="meta">
+        <span>初検出：{escape(str(first_detected))}</span>
+        <span>出現：{escape(str(detected_count))}回</span>
+        <span>順位：{stock["rank"]}位</span>
+    </div>
+
+    <div class="price-grid">
+        <div>
+            <span class="label">現在値</span>
+            <strong>{stock["price_num"]:,.1f}</strong>
+        </div>
+        <div>
+            <span class="label">前日終値</span>
+            <strong>{stock["previous_close"]:,.1f}</strong>
+        </div>
+    </div>
+
+    <div class="target-grid">
+        <div>
+            <span class="label">10%</span>
+            <strong>{stock["price_10"]:,.1f}</strong>
+        </div>
+        <div>
+            <span class="label">12%</span>
+            <strong>{stock["price_12"]:,.1f}</strong>
+        </div>
+        <div>
+            <span class="label">14%</span>
+            <strong>{stock["price_14"]:,.1f}</strong>
+        </div>
+    </div>
+
+    <a class="yahoo-button" href="https://finance.yahoo.co.jp/quote/{stock["code"]}.T" target="_blank">
+        Yahooで開く
+    </a>
+</div>
+"""
+
+    return f"""
+<div class="mobile-only">
+{cards}
+</div>
+"""
+
+
+def render_result_block(targets, merged=False):
+    return render_cards(targets, merged=merged) + render_table(targets, merged=merged)
 
 
 def create_index(data):
@@ -150,6 +209,7 @@ body {{
 
 h1 {{
     font-size: 22px;
+    margin-bottom: 12px;
 }}
 
 h2 {{
@@ -160,8 +220,13 @@ h2 {{
 .info, .section {{
     background: white;
     padding: 12px;
-    border-radius: 8px;
+    border-radius: 10px;
     margin-bottom: 16px;
+    border: 1px solid #ddd;
+}}
+
+.info p, .section p {{
+    margin: 5px 0;
 }}
 
 .table-wrap {{
@@ -210,21 +275,125 @@ a {{
     text-decoration: none;
 }}
 
-@media (max-width: 600px) {{
+.mobile-only {{
+    display: none;
+}}
+
+.stock-card {{
+    border-radius: 14px;
+    padding: 14px;
+    margin-bottom: 14px;
+    border: 1px solid #ddd;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+}}
+
+.card-yellow {{
+    background: #fff7d6;
+}}
+
+.card-pink {{
+    background: #ffe3ec;
+}}
+
+.card-header {{
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: flex-start;
+    margin-bottom: 10px;
+}}
+
+.code {{
+    font-size: 18px;
+    font-weight: bold;
+}}
+
+.company-name {{
+    font-size: 15px;
+    font-weight: bold;
+    line-height: 1.4;
+}}
+
+.drop {{
+    font-size: 20px;
+    font-weight: bold;
+    color: #b00020;
+    white-space: nowrap;
+}}
+
+.meta {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    font-size: 13px;
+    margin-bottom: 12px;
+}}
+
+.meta span {{
+    background: rgba(255,255,255,0.7);
+    padding: 4px 8px;
+    border-radius: 999px;
+}}
+
+.price-grid {{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-bottom: 10px;
+}}
+
+.target-grid {{
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 8px;
+    margin-bottom: 12px;
+}}
+
+.price-grid div,
+.target-grid div {{
+    background: rgba(255,255,255,0.75);
+    border-radius: 10px;
+    padding: 8px;
+    text-align: right;
+}}
+
+.label {{
+    display: block;
+    font-size: 12px;
+    color: #555;
+    margin-bottom: 4px;
+    text-align: left;
+}}
+
+.yahoo-button {{
+    display: block;
+    text-align: center;
+    background: #333;
+    color: white;
+    padding: 10px;
+    border-radius: 10px;
+    font-weight: bold;
+}}
+
+@media (max-width: 700px) {{
     body {{
         margin: 8px;
     }}
 
-    table {{
-        font-size: 12px;
+    .pc-only {{
+        display: none;
     }}
 
-    th, td {{
-        padding: 6px;
+    .mobile-only {{
+        display: block;
     }}
 
-    td.company {{
-        min-width: 180px;
+    h1 {{
+        font-size: 21px;
+    }}
+
+    h2 {{
+        font-size: 17px;
     }}
 }}
 </style>
@@ -247,18 +416,14 @@ a {{
 <p>該当件数：{len(merged_targets)}件</p>
 </div>
 
-<div class="table-wrap">
-{render_table(merged_targets, merged=True)}
-</div>
+{render_result_block(merged_targets, merged=True)}
 """
 
     for snapshot in snapshots:
         html += f"""
 <h2>{escape(snapshot["time"])} 取得結果</h2>
 <p>ランキング取得：{len(snapshot["stocks"])}件 / 条件該当：{len(snapshot["targets"])}件</p>
-<div class="table-wrap">
-{render_table(snapshot["targets"], merged=False)}
-</div>
+{render_result_block(snapshot["targets"], merged=False)}
 """
 
     html += """
