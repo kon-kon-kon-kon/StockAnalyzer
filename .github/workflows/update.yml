@@ -1,0 +1,73 @@
+name: Update stock data
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # 前場：平日 09:20～11:30、日本時間、5分間隔
+    - cron: "20-55/5 9 * * 1-5"
+      timezone: "Asia/Tokyo"
+    - cron: "*/5 10 * * 1-5"
+      timezone: "Asia/Tokyo"
+    - cron: "0-30/5 11 * * 1-5"
+      timezone: "Asia/Tokyo"
+
+    # 後場：平日 12:30～15:30、日本時間、5分間隔
+    - cron: "30-55/5 12 * * 1-5"
+      timezone: "Asia/Tokyo"
+    - cron: "*/5 13-14 * * 1-5"
+      timezone: "Asia/Tokyo"
+    - cron: "0-30/5 15 * * 1-5"
+      timezone: "Asia/Tokyo"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: stock-data-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+
+    env:
+      # テスト中は -3.0。本番に戻す場合は -6.0 に変更する。
+      DROP_THRESHOLD: "-3.0"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Fetch and create latest stock data
+        run: python github_report.py
+
+      - name: Commit and push data.json
+        shell: bash
+        run: |
+          if git diff --quiet -- docs/data.json; then
+            echo "data.jsonに変更はありません。"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add docs/data.json
+          git commit -m "Update stock data"
+          git pull --rebase origin main
+          git push origin HEAD:main
