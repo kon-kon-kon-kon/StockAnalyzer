@@ -4,19 +4,25 @@ on:
   workflow_dispatch:
 
   schedule:
-    # 前場：平日 09:20～11:30、日本時間、5分間隔
+    # 前場：平日09:20～11:30
+    # 日本時間、5分間隔
     - cron: "20-55/5 9 * * 1-5"
       timezone: "Asia/Tokyo"
+
     - cron: "*/5 10 * * 1-5"
       timezone: "Asia/Tokyo"
+
     - cron: "0-30/5 11 * * 1-5"
       timezone: "Asia/Tokyo"
 
-    # 後場：平日 12:30～15:30、日本時間、5分間隔
+    # 後場：平日12:30～15:30
+    # 日本時間、5分間隔
     - cron: "30-55/5 12 * * 1-5"
       timezone: "Asia/Tokyo"
+
     - cron: "*/5 13-14 * * 1-5"
       timezone: "Asia/Tokyo"
+
     - cron: "0-30/5 15 * * 1-5"
       timezone: "Asia/Tokyo"
 
@@ -33,7 +39,8 @@ jobs:
     timeout-minutes: 4
 
     env:
-      # テスト中は -3.0。本番に戻す場合は -6.0 に変更する。
+      # 現在はテスト用の－3％
+      # 本番に戻す場合は－6％にする
       DROP_THRESHOLD: "-3.0"
 
     steps:
@@ -69,5 +76,6 @@ jobs:
 
           git add docs/data.json
           git commit -m "Update stock data"
+
           git pull --rebase origin main
           git push origin HEAD:main
