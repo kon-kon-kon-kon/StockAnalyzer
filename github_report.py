@@ -1,480 +1,331 @@
+from __future__ import annotations
+
 import json
-from datetime import datetime, timedelta, timezone
+import os
+import re
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from html import escape
+from typing import Any
+from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
-from scraper.yahoo_scraper import get_top150
-from analyzer.calculator import analyze_stocks
+import requests
+from bs4 import BeautifulSoup, Tag
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
-DOCS_DIR = Path("docs")
-DATA_PATH = DOCS_DIR / "data.json"
-INDEX_PATH = DOCS_DIR / "index.html"
+JST = ZoneInfo("Asia/Tokyo")
+BASE_URL = "https://finance.yahoo.co.jp"
+RANKING_URL = (
+    "https://finance.yahoo.co.jp/stocks/ranking/"
+    "tradingValueHigh?market=all&page={page}"
+)
+OUTPUT_PATH = Path("docs/data.json")
+PAGES_TO_FETCH = 3
+MAX_STOCKS = 150
+DROP_THRESHOLD = float(os.getenv("DROP_THRESHOLD", "-3.0"))
+REQUEST_INTERVAL_SECONDS = 1.0
+
+QUOTE_PATH_PATTERN = re.compile(
+    r"^/quote/(?P<code>[0-9A-Z]+)\.T/?(?:\?.*)?$"
+)
+ROW_VALUE_PATTERN = re.compile(
+    r"(?P<price>\d[\d,]*(?:\.\d+)?)\s*"
+    r"(?P<quote_time>\d{1,2}:\d{2})\s*"
+    r"(?P<diff>[+-]?\d[\d,]*(?:\.\d+)?)\s*"
+    r"(?P<percent>[+-]?\d+(?:\.\d+)?)%\s*"
+    r"(?P<trading_value>\d[\d,]*)"
+)
+SOURCE_TIME_PATTERN = re.compile(
+    r"更新日時[：:]\s*(?P<date>\d{4}/\d{1,2}/\d{1,2})\s+"
+    r"(?P<time>\d{1,2}:\d{2})"
+)
 
 
-def now_jst():
-    return datetime.now(timezone.utc).astimezone(
-        timezone(timedelta(hours=9))
+@dataclass(frozen=True)
+class ParsedStock:
+    rank: int
+    code: str
+    company: str
+    price: float
+    diff_yen: float
+    diff_percent: float
+    trading_value: int
+    quote_time: str
+
+    def to_dict(self) -> dict[str, Any]:
+        previous_close = self.price - self.diff_yen
+
+        return {
+            "rank": self.rank,
+            "code": self.code,
+            "company": self.company,
+            "price": self.price,
+            "diff_yen": self.diff_yen,
+            "diff_percent": self.diff_percent,
+            "trading_value": self.trading_value,
+            "quote_time": self.quote_time,
+            "previous_close": round(previous_close, 2),
+            "price_10": round(previous_close * 0.90, 2),
+            "price_12": round(previous_close * 0.88, 2),
+            "price_14": round(previous_close * 0.86, 2),
+        }
+
+
+def build_session() -> requests.Session:
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        status=3,
+        backoff_factor=1.0,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        raise_on_status=False,
     )
 
+    adapter = HTTPAdapter(max_retries=retry)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/149.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6",
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,*/*;q=0.8"
+            ),
+        }
+    )
+    return session
 
-def load_data(today):
-    if not DATA_PATH.exists():
-        return {"date": today, "snapshots": []}
+
+def parse_number(value: str) -> float:
+    return float(value.replace(",", "").replace("+", "").strip())
+
+
+def find_stock_container(anchor: Tag, code: str) -> Tag | None:
+    node: Tag | None = anchor
+
+    for _ in range(9):
+        parent = node.parent if node is not None else None
+        if not isinstance(parent, Tag):
+            return None
+
+        text = " ".join(parent.stripped_strings)
+        if code in text and "%" in text and ROW_VALUE_PATTERN.search(text):
+            return parent
+
+        node = parent
+
+    return None
+
+
+def parse_source_updated_at(soup: BeautifulSoup) -> str | None:
+    page_text = " ".join(soup.stripped_strings)
+    match = SOURCE_TIME_PATTERN.search(page_text)
+    if not match:
+        return None
+
+    return f"{match.group('date').replace('/', '-')} {match.group('time')}"
+
+
+def parse_ranking_page(
+    html: str,
+    page_number: int,
+) -> tuple[list[ParsedStock], str | None]:
+    soup = BeautifulSoup(html, "html.parser")
+    source_updated_at = parse_source_updated_at(soup)
+    stocks: list[ParsedStock] = []
+    seen_codes: set[str] = set()
+
+    for anchor in soup.find_all("a", href=True):
+        if not isinstance(anchor, Tag):
+            continue
+
+        href = str(anchor.get("href", ""))
+        path = href
+        if href.startswith(BASE_URL):
+            path = href.removeprefix(BASE_URL)
+
+        quote_match = QUOTE_PATH_PATTERN.match(path)
+        if not quote_match:
+            continue
+
+        code = quote_match.group("code")
+        if code in seen_codes:
+            continue
+
+        company = " ".join(anchor.stripped_strings).strip()
+        if not company or company == code:
+            continue
+
+        container = find_stock_container(anchor, code)
+        if container is None:
+            continue
+
+        row_text = " ".join(container.stripped_strings)
+        value_match = ROW_VALUE_PATTERN.search(row_text)
+        if value_match is None:
+            continue
+
+        try:
+            price = parse_number(value_match.group("price"))
+            diff_yen = parse_number(value_match.group("diff"))
+            diff_percent = parse_number(value_match.group("percent"))
+            trading_value = int(
+                value_match.group("trading_value").replace(",", "")
+            )
+        except (TypeError, ValueError):
+            continue
+
+        rank = ((page_number - 1) * 50) + len(stocks) + 1
+        stocks.append(
+            ParsedStock(
+                rank=rank,
+                code=code,
+                company=company,
+                price=price,
+                diff_yen=diff_yen,
+                diff_percent=diff_percent,
+                trading_value=trading_value,
+                quote_time=value_match.group("quote_time"),
+            )
+        )
+        seen_codes.add(code)
+
+        if len(stocks) >= 50:
+            break
+
+    return stocks, source_updated_at
+
+
+def fetch_top_stocks() -> tuple[list[ParsedStock], str | None]:
+    session = build_session()
+    all_stocks: list[ParsedStock] = []
+    source_times: list[str] = []
+    seen_codes: set[str] = set()
+
+    for page in range(1, PAGES_TO_FETCH + 1):
+        url = RANKING_URL.format(page=page)
+        print(f"取得中: {url}")
+
+        response = session.get(url, timeout=(10, 30))
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"ランキングページの取得に失敗しました。"
+                f" page={page}, status={response.status_code}"
+            )
+
+        page_stocks, source_updated_at = parse_ranking_page(
+            response.text,
+            page,
+        )
+
+        if len(page_stocks) < 40:
+            raise RuntimeError(
+                f"ページ{page}から{len(page_stocks)}件しか解析できませんでした。"
+                " Yahoo!ファイナンスのHTML構造が変わった可能性があります。"
+            )
+
+        for stock in page_stocks:
+            if stock.code in seen_codes:
+                continue
+            all_stocks.append(stock)
+            seen_codes.add(stock.code)
+
+        if source_updated_at:
+            source_times.append(source_updated_at)
+
+        if page < PAGES_TO_FETCH:
+            time.sleep(REQUEST_INTERVAL_SECONDS)
+
+    all_stocks = all_stocks[:MAX_STOCKS]
+
+    if len(all_stocks) < MAX_STOCKS:
+        raise RuntimeError(
+            f"150件の取得を想定していますが、{len(all_stocks)}件でした。"
+        )
+
+    latest_source_time = max(source_times) if source_times else None
+    return all_stocks, latest_source_time
+
+
+def create_output(
+    all_stocks: list[ParsedStock],
+    source_updated_at: str | None,
+) -> dict[str, Any]:
+    now = datetime.now(JST)
+
+    targets = [
+        stock.to_dict()
+        for stock in all_stocks
+        if stock.diff_percent <= DROP_THRESHOLD
+    ]
+    targets.sort(key=lambda stock: stock["diff_percent"])
+
+    return {
+        "date": now.strftime("%Y-%m-%d"),
+        "updated_at": now.strftime("%H:%M:%S"),
+        "source_updated_at": source_updated_at,
+        "threshold": DROP_THRESHOLD,
+        "source_count": len(all_stocks),
+        "count": len(targets),
+        "stocks": targets,
+    }
+
+
+def write_json_atomic(data: dict[str, Any], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="\n",
+        dir=output_path.parent,
+        prefix="data-",
+        suffix=".tmp",
+        delete=False,
+    ) as temporary_file:
+        json.dump(
+            data,
+            temporary_file,
+            ensure_ascii=False,
+            indent=2,
+        )
+        temporary_file.write("\n")
+        temporary_path = Path(temporary_file.name)
+
+    temporary_path.replace(output_path)
+
+
+def main() -> int:
+    print(f"抽出条件: 前日比 {DROP_THRESHOLD:.1f}% 以下")
 
     try:
-        data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {"date": today, "snapshots": []}
-
-    if data.get("date") != today:
-        return {"date": today, "snapshots": []}
-
-    return data
-
-
-def save_data(data):
-    DOCS_DIR.mkdir(exist_ok=True)
-    DATA_PATH.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
-
-
-def sort_by_drop_rate(targets):
-    return sorted(
-        targets,
-        key=lambda stock: stock.get("diff_percent_num", 0)
-    )
-
-
-def merge_targets(snapshots):
-    merged = {}
-
-    for snapshot in snapshots:
-        for stock in snapshot["targets"]:
-            code = stock["code"]
-
-            if code not in merged:
-                stock_copy = stock.copy()
-                stock_copy["first_detected"] = snapshot["time"]
-                stock_copy["detected_times"] = [snapshot["time"]]
-                stock_copy["detected_count"] = 1
-                merged[code] = stock_copy
-            else:
-                old = merged[code]
-                stock_copy = stock.copy()
-                stock_copy["first_detected"] = old["first_detected"]
-                stock_copy["detected_times"] = old["detected_times"] + [snapshot["time"]]
-                stock_copy["detected_count"] = len(stock_copy["detected_times"])
-                merged[code] = stock_copy
-
-    return sort_by_drop_rate(list(merged.values()))
-
-
-def render_table(targets, merged=False):
-    targets = sort_by_drop_rate(targets)
-
-    rows = ""
-
-    for index, stock in enumerate(targets):
-        row_class = "row-yellow" if index % 2 == 0 else "row-pink"
-
-        first_detected = stock.get("first_detected", "-") if merged else "-"
-        detected_count = stock.get("detected_count", "-") if merged else "-"
-
-        rows += f"""
-<tr class="{row_class}">
-<td>{escape(str(first_detected))}</td>
-<td>{escape(str(detected_count))}</td>
-<td>{stock["rank"]}</td>
-<td>{escape(stock["code"])}</td>
-<td class="company">{escape(stock["company"])}</td>
-<td>{stock["price_num"]:,.1f}</td>
-<td>{stock["previous_close"]:,.1f}</td>
-<td>{stock["diff_percent_num"]:.2f}%</td>
-<td>{stock["price_10"]:,.1f}</td>
-<td>{stock["price_12"]:,.1f}</td>
-<td>{stock["price_14"]:,.1f}</td>
-<td><a href="https://finance.yahoo.co.jp/quote/{stock["code"]}.T" target="_blank">開く</a></td>
-</tr>
-"""
-
-    return f"""
-<div class="table-wrap pc-only">
-<table>
-<thead>
-<tr>
-<th>初検出</th>
-<th>出現</th>
-<th>順位</th>
-<th>コード</th>
-<th>会社名</th>
-<th>現在値</th>
-<th>前日終値</th>
-<th>下落率</th>
-<th>10%</th>
-<th>12%</th>
-<th>14%</th>
-<th>Yahoo</th>
-</tr>
-</thead>
-<tbody>
-{rows}
-</tbody>
-</table>
-</div>
-"""
-
-
-def render_cards(targets, merged=False):
-    targets = sort_by_drop_rate(targets)
-
-    cards = ""
-
-    for index, stock in enumerate(targets):
-        card_class = "card-yellow" if index % 2 == 0 else "card-pink"
-
-        first_detected = stock.get("first_detected", "-") if merged else "-"
-        detected_count = stock.get("detected_count", "-") if merged else "-"
-
-        cards += f"""
-<div class="stock-card {card_class}">
-    <div class="card-header">
-        <div>
-            <div class="code">{escape(stock["code"])}</div>
-            <div class="company-name">{escape(stock["company"])}</div>
-        </div>
-        <div class="drop">{stock["diff_percent_num"]:.2f}%</div>
-    </div>
-
-    <div class="meta">
-        <span>初検出：{escape(str(first_detected))}</span>
-        <span>出現：{escape(str(detected_count))}回</span>
-        <span>順位：{stock["rank"]}位</span>
-    </div>
-
-    <div class="price-grid">
-        <div>
-            <span class="label">現在値</span>
-            <strong>{stock["price_num"]:,.1f}</strong>
-        </div>
-        <div>
-            <span class="label">前日終値</span>
-            <strong>{stock["previous_close"]:,.1f}</strong>
-        </div>
-    </div>
-
-    <div class="target-grid">
-        <div>
-            <span class="label">10%</span>
-            <strong>{stock["price_10"]:,.1f}</strong>
-        </div>
-        <div>
-            <span class="label">12%</span>
-            <strong>{stock["price_12"]:,.1f}</strong>
-        </div>
-        <div>
-            <span class="label">14%</span>
-            <strong>{stock["price_14"]:,.1f}</strong>
-        </div>
-    </div>
-</div>
-"""
-
-    return f"""
-<div class="mobile-only">
-{cards}
-</div>
-"""
-
-
-def render_result_block(targets, merged=False):
-    return render_cards(targets, merged=merged) + render_table(targets, merged=merged)
-
-
-def create_index(data):
-    snapshots = data["snapshots"]
-    merged_targets = merge_targets(snapshots)
-    updated_at = snapshots[-1]["time"] if snapshots else "-"
-
-    html = f"""<!DOCTYPE html>
-<html lang="ja">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="refresh" content="60">
-<meta name="theme-color" content="#333333">
-<link rel="manifest" href="./manifest.json">
-<title>株分析ツール</title>
-
-<style>
-body {{
-    font-family: Meiryo, sans-serif;
-    background: #f5f6f8;
-    margin: 12px;
-    color: #222;
-}}
-
-h1 {{
-    font-size: 22px;
-    margin-bottom: 12px;
-}}
-
-h2 {{
-    font-size: 18px;
-    margin-top: 28px;
-}}
-
-.info, .section {{
-    background: white;
-    padding: 12px;
-    border-radius: 10px;
-    margin-bottom: 16px;
-    border: 1px solid #ddd;
-}}
-
-.info p, .section p {{
-    margin: 5px 0;
-}}
-
-.table-wrap {{
-    overflow-x: auto;
-}}
-
-table {{
-    border-collapse: collapse;
-    width: 100%;
-    background: white;
-    margin-bottom: 30px;
-    font-size: 14px;
-}}
-
-th {{
-    background: #333;
-    color: white;
-    padding: 8px;
-    position: sticky;
-    top: 0;
-    white-space: nowrap;
-}}
-
-td {{
-    border: 1px solid #ddd;
-    padding: 7px;
-    text-align: right;
-    white-space: nowrap;
-}}
-
-td.company {{
-    text-align: left;
-    min-width: 260px;
-}}
-
-tr.row-yellow {{
-    background: #fff7d6;
-}}
-
-tr.row-pink {{
-    background: #ffe3ec;
-}}
-
-a {{
-    color: #0066cc;
-    text-decoration: none;
-}}
-
-.mobile-only {{
-    display: none;
-}}
-
-.stock-card {{
-    border-radius: 14px;
-    padding: 14px;
-    margin-bottom: 14px;
-    border: 1px solid #ddd;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.08);
-}}
-
-.card-yellow {{
-    background: #fff7d6;
-}}
-
-.card-pink {{
-    background: #ffe3ec;
-}}
-
-.card-header {{
-    display: flex;
-    justify-content: space-between;
-    gap: 12px;
-    align-items: flex-start;
-    margin-bottom: 10px;
-}}
-
-.code {{
-    font-size: 18px;
-    font-weight: bold;
-}}
-
-.company-name {{
-    font-size: 15px;
-    font-weight: bold;
-    line-height: 1.4;
-}}
-
-.drop {{
-    font-size: 20px;
-    font-weight: bold;
-    color: #b00020;
-    white-space: nowrap;
-}}
-
-.meta {{
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    font-size: 13px;
-    margin-bottom: 12px;
-}}
-
-.meta span {{
-    background: rgba(255,255,255,0.7);
-    padding: 4px 8px;
-    border-radius: 999px;
-}}
-
-.price-grid {{
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 8px;
-    margin-bottom: 10px;
-}}
-
-.target-grid {{
-    display: grid;
-    grid-template-columns: 1fr 1fr 1fr;
-    gap: 8px;
-    margin-bottom: 2px;
-}}
-
-.price-grid div,
-.target-grid div {{
-    background: rgba(255,255,255,0.75);
-    border-radius: 10px;
-    padding: 8px;
-    text-align: right;
-}}
-
-.label {{
-    display: block;
-    font-size: 12px;
-    color: #555;
-    margin-bottom: 4px;
-    text-align: left;
-}}
-
-@media (max-width: 700px) {{
-    body {{
-        margin: 8px;
-    }}
-
-    .pc-only {{
-        display: none;
-    }}
-
-    .mobile-only {{
-        display: block;
-    }}
-
-    .history-section {{
-        display: none;
-    }}
-
-    h1 {{
-        font-size: 21px;
-    }}
-
-    h2 {{
-        font-size: 17px;
-    }}
-}}
-</style>
-</head>
-
-<body>
-<h1>株分析ツール</h1>
-
-<div class="info">
-<p>日付：{escape(data["date"])}</p>
-<p>最新更新：{escape(updated_at)}</p>
-<p>対象：売買代金ランキング150位以内</p>
-<p>抽出条件：前日比 -6.0% 以下</p>
-<p>表示順：下落率が大きい順</p>
-<p>ページは60秒ごとに自動更新されます。</p>
-</div>
-
-<div class="section">
-<h2>統合一覧</h2>
-<p>重複銘柄は1件だけ表示します。複数回出た場合は最新データを表示します。</p>
-<p>該当件数：{len(merged_targets)}件</p>
-</div>
-
-{render_result_block(merged_targets, merged=True)}
-"""
-
-    for snapshot in snapshots:
-        html += f"""
-<div class="history-section">
-<h2>{escape(snapshot["time"])} 取得結果</h2>
-<p>ランキング取得：{len(snapshot["stocks"])}件 / 条件該当：{len(snapshot["targets"])}件</p>
-{render_result_block(snapshot["targets"], merged=False)}
-</div>
-"""
-
-    html += """
-<script>
-if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("./service-worker.js");
-}
-</script>
-</body>
-</html>
-"""
-
-    INDEX_PATH.write_text(html, encoding="utf-8")
-
-
-def main():
-    now = now_jst()
-    today = now.strftime("%Y-%m-%d")
-    current_time = now.strftime("%H:%M")
-
-    print(f"{current_time} 取得開始")
-
-    data = load_data(today)
-
-    stocks = get_top150()
-    targets = analyze_stocks(stocks)
-
-    data["snapshots"] = [
-        s for s in data["snapshots"]
-        if s["time"] != current_time
-    ]
-
-    data["snapshots"].append({
-        "time": current_time,
-        "stocks": stocks,
-        "targets": targets,
-    })
-
-    data["snapshots"].sort(key=lambda x: x["time"])
-
-    save_data(data)
-    create_index(data)
-
-    print(f"{current_time} 取得完了：{len(stocks)}件 / 該当 {len(targets)}件")
+        all_stocks, source_updated_at = fetch_top_stocks()
+        output = create_output(all_stocks, source_updated_at)
+        write_json_atomic(output, OUTPUT_PATH)
+    except Exception as error:
+        print(f"エラー: {error}", file=sys.stderr)
+        return 1
+
+    print(f"取得件数: {output['source_count']}件")
+    print(f"該当件数: {output['count']}件")
+    print(f"保存先: {OUTPUT_PATH}")
+    print(f"更新時刻: {output['date']} {output['updated_at']} JST")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
